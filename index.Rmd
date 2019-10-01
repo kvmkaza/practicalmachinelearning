@@ -1,0 +1,300 @@
+---
+title: "Machine Learning Peer Review Assignment"
+author: "Maruthi Kaza"
+date: "30/09/2019"
+output: html_document
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo=FALSE,message=FALSE, warning = FALSE)
+```
+
+## **Executive Summary**
+"Qualitative Activity Recognition of Weight Lifting Exercises" project conducted by Velloso E, et al.  aimed to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 healthy participants who were asked to perform barbell lifts correctly and incorrectly in 5 different ways. 
+Our goal is to train a prediction model on the training data and predict the manner in which they did the exercise and predict 20 different test cases available in the testing data set.
+
+
+```{r LoadLibrariesData}
+library(dplyr)
+library(caret)
+library(parallel)
+library(doParallel)
+library(xtable)
+
+training=read.csv("./pml-training.csv", stringsAsFactors = FALSE)
+testing=read.csv("./pml-testing.csv", stringsAsFactors = FALSE)
+```
+
+### **Exploratory Data Analysis**
+
+```{r EDA}
+rownum_trn <- nrow(training)
+rownum_tst <- nrow(testing)
+datasetInfo <- data.frame(
+  Dataset=c("Training","Testing"),
+  Observations=c(nrow(training),nrow(testing)),
+  Variables=c(ncol(training),ncol(testing))
+  )
+```
+
+```{r datasetInfopr1, results="asis"}
+print(xtable(datasetInfo, auto=TRUE), type="html")
+```
+
+```{r}
+training %>% count(classe) %>% print(xtable(auto = TRUE))
+```
+
+We find that the training data set has 19622 observations and 160 variables. Variable **"classe"** is the outcome and the rest 159 are predictors. Similarly the testing data set has 20 observations and 160 variables. We need to train an appropriate model to predict "classe" values for the testing data set.
+The training data set is sufficiently balanced on "classe" outcome making Random Forest an apt classification method.
+
+### **Feature Selection**
+Key part of feature selection is to remove variables with little or no variability as to be useless as a predictor of the dependent variable. Hence we explore the data to identify those with high percentage of NA values or with Near Zero Variance that are not useful for predicting exercise quality. We also find that first 6 spurious predictors i.e user_name, time_stamp and new_window/num_window etc. are for house keeping and hence do not contribute to the prediction model and hence are removed. We prepare the test data also on similar lines. 
+We then partition the training data to train and validation sub-sets so we can train models on training sub-set, predict and check the accuracy on the validation sub-set before classifying the test data.
+
+```{r prepareData, cache=TRUE}
+## Training data
+NAdf_trn <- data.frame(name=names(colSums(is.na(training))),
+                       na_percent=(colSums(is.na(training))/rownum_trn)*100)  
+NAdf_trn <- NAdf_trn %>% filter(NAdf_trn$na_percent>0)
+NArows <- nrow(NAdf_trn)
+training <- select(training,-c(as.character(NAdf_trn$name)))
+
+nztrn <- nearZeroVar(training)
+if (length(nztrn)> 0) {
+  training <- training[,-(nztrn[!nztrn==93])]
+}
+training <- training[,7:length(colnames(training))]
+training$classe <- factor(training$classe)
+
+## Test data
+NAdf_tst <- data.frame(name=names(colSums(is.na(testing))),
+                      na_percent=(colSums(is.na(testing))/rownum_tst)*100)  
+NAdf_tst <- NAdf_tst %>% filter(NAdf_tst$na_percent>0)
+testSmall <- select(testing,-c(as.character(NAdf_tst$name)))
+nztst <- nearZeroVar(testSmall)
+if (length(nztst)> 0) {
+  testSmall <- testSmall[,-(nztst)]
+}
+testSmall <- testSmall[,7:length(colnames(testSmall))]
+```
+
+
+```{r dataPart, cache=TRUE}
+trnInd <- createDataPartition(training$classe,p=0.7,list = FALSE)
+trnSmall <- training[trnInd,]
+trnValidn <- training[-trnInd,]
+
+datasetInfo <- data.frame(
+  Dataset=c("Training (trnSmall)","Validation (trnValidn)","Testing (testSmall)"),
+  Percentage=c("70%","30%","100%"),
+  Rows=c(nrow(trnSmall),nrow(trnValidn),nrow(testSmall)),
+  Columns=c(ncol(trnSmall),ncol(trnValidn),ncol(testSmall))
+  )
+rm(training)  ## remove training data set to conserve memory 
+rm(testing)   ## remove testing data set to conserve memory
+
+```
+
+```{r datasetInfopr, results="asis"}
+print(xtable(datasetInfo, auto=TRUE), type="html")
+
+```
+
+
+We find that we could reduce features to 53 from original 159 which helps in better model training.
+
+```{r seedVal, cache=TRUE}
+##Set seed value for reproducability
+seedval <- 12345
+```
+
+```{r parallel}
+##We configure parallel processing to utilize all CPU cores
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+```
+
+### **Modeling with Random Forest Classification**
+We use Random Forest classification with built in cross validation component which also output the OOB sample error estimate along with Accuracy of the prediction model. We use these Accuracy and OOB estimates to further fine-tune the model
+
+##### **Model 1: Random Forest classification with 3-fold cross validation**
+
+```{r defRF, cache=TRUE, echo=TRUE}
+set.seed(seedval)
+cntlRF <- trainControl(method = "cv", number = 3, allowParallel = TRUE)
+model_rfDef<- train(classe~., data = trnSmall,method="rf", preProcess = c("center","scale"), trControl = cntlRF)
+```
+
+```{r modelComp1}
+modelComp <- data.frame(
+  Model=1,
+  Accuracy=round(model_rfDef$results$Accuracy[1],6),
+  OOB_Error_rate=round(model_rfDef$finalModel$err.rate[500,1][["OOB"]]*100,4),
+  Num_Trees=model_rfDef$finalModel$ntree,
+  MTry=model_rfDef$finalModel$mtry)
+```
+
+```{r modelComp1pr, results="asis"}
+##print(xtable(modelComp),type="html")
+```
+
+##### **Model 2: Random Forest classification with repeated 3-fold/3-repeat cross validation with default 'mtry'**
+
+```{r RCV, cache=TRUE, echo=TRUE}
+set.seed(seedval)
+cntlRCV <- trainControl(method="repeatedcv", number=3, repeats=3, allowParallel = TRUE)
+tunegrid <- expand.grid(.mtry=sqrt(ncol(trnSmall))) ## start with default for 'mtry'
+model_rcv <- train(classe~., data=trnSmall, method="rf", tuneGrid=tunegrid, trControl=cntlRCV)
+```
+
+```{r modelComp2}
+modelComp <- rbind(modelComp, data.frame(
+                              Model=2,
+                              Accuracy=round(model_rcv$results$Accuracy,6),
+                              OOB_Error_rate=round(model_rcv$finalModel$err.rate[500,1][["OOB"]]*100,4),
+                              Num_Trees=model_rcv$finalModel$ntree,
+                              MTry=model_rcv$finalModel$mtry))
+```
+
+##### **Model 3: Random Forest classification with repeated 3-fold/3-repeat cross validation to find the optimal 'mtry' values**
+
+```{r RCVmtry, cache=TRUE, echo=TRUE}
+set.seed(seedval)
+cntlRCV2 <- trainControl(method="repeatedcv", number=3, repeats=3, search="random", allowParallel = TRUE)
+model_rcv2<- train(classe~., data=trnSmall, method="rf", tuneLength=5, trControl=cntlRCV2)
+```
+
+```{r}
+for (i in 1:5){
+  modelComp <- rbind(modelComp, data.frame(
+                      Model=paste(3,i,sep = "."),
+                      Accuracy=round(model_rcv2$results$Accuracy[i],6),
+                      OOB_Error_rate=round(model_rcv2$finalModel$err.rate[500,1][["OOB"]]*100,4),
+                      Num_Trees=model_rcv2$finalModel$ntree,
+                      MTry=model_rcv2$results$mtry[i]))
+  }
+```
+
+We plot the 'mtry' values with 'Accuracy' to find the optimal 'mtry' yeilding maximum 'Accuracy'
+
+```{r plotR, cache=TRUE, fig.height=4, fig.width=4}
+plot(model_rcv2)
+
+```
+
+##### **Model 4: Random Forest classification with repeated 3-fold/3-repeat cross validation to find optimal 'ntree' for default 'mtry' value**
+
+```{r RCVnTree, cache=TRUE, echo=TRUE}
+cntlRCV3 <- trainControl(method="repeatedcv", number=3, repeats=3, search="grid", allowParallel = TRUE)
+Mtry <- sqrt(ncol(trnSmall))
+tunegrid <- expand.grid(.mtry=Mtry)
+ntree_models <- list()
+for (ntree in c(1000,1500,2000)) {
+  set.seed(seedval)
+  modelTree <- train(classe~., data=trnSmall, method="rf", tuneGrid=tunegrid, traincontrol=cntlRCV3, ntree=ntree)
+  ntree_models[[toString(ntree)]] <- modelTree
+}
+```
+
+Comparing the models with different nTree values:
+
+```{r compareTree}
+ntree_res <- resamples(ntree_models)
+
+modelComp <- rbind(modelComp, data.frame(
+                              Model=c(4.1,4.2,4.3),
+                              Accuracy=c(round(summary(ntree_res)[3]$statistics$Accuracy[1,4],6),
+                                         round(summary(ntree_res)[3]$statistics$Accuracy[2,4],6),
+                                         round(summary(ntree_res)[3]$statistics$Accuracy[3,4],6)),
+                              OOB_Error_rate=c("","",""),
+                              Num_Trees=c(1000,1500,2000),
+                              MTry=c(Mtry,Mtry,Mtry)))
+
+```
+
+```{r dotPlot, fig.height=4, fig.width=8}
+dotplot(ntree_res)
+```
+
+
+```{r modelComp4, results="asis"}
+print(xtable(modelComp, auto = TRUE, caption = "Model Accuracies and OOB Error rates"), caption.placement="top", type="html")
+```
+
+From the above we find that Accuracy is highest for nTree=1500
+
+#### **Model 5: Random Forest classification with repeated 3-fold/3-repeat cross validation; with ntree=1500 and default 'mtry' which yeilds the highest Accuracy and lowest OOB Error rate**
+
+```{r FinalModel, cache=TRUE, echo=TRUE}
+set.seed(seedval)
+cntlRCVFinal <- trainControl(method="repeatedcv", number=3, repeats=3, allowParallel = TRUE)
+tunegrid <- expand.grid(.mtry=sqrt(ncol(trnSmall))) ## default for 'mtry'
+model_rcvFinal<- train(classe~., data=trnSmall, method="rf",tuneGrid=tunegrid, ntree=1500, 
+                       trControl=cntlRCVFinal)
+```
+
+```{r}
+modelFinal <- data.frame(
+                Model="Final Model",
+                Accuracy=round(model_rcvFinal$results$Accuracy,6),                                               OOB_Error_rate=round(model_rcvFinal$finalModel$err.rate[500,1][["OOB"]]*100,4),
+                Num_Trees=model_rcvFinal$finalModel$ntree,
+                MTry=model_rcvFinal$finalModel$mtry)
+```
+
+```{r modelComp5, results="asis"}
+print(xtable(modelFinal, auto = TRUE), type="html")
+
+```
+
+```{r normalProc}
+## Return to normal processing
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+We now predict using the RF CV and RF RCV final models on the validation data set and check accuracies achieved
+
+```{r predValn, cache=TRUE}
+set.seed(seedval)
+predFit_rf <- predict(model_rfDef, trnValidn)
+predFit_rcv <- predict(model_rcvFinal, trnValidn)
+
+##ConfusionMatrix to assess overall accuracy of prediction
+
+cm_rf <- confusionMatrix(predFit_rf,factor(trnValidn$classe))
+cm_rcv <- confusionMatrix(predFit_rcv,factor(trnValidn$classe))
+
+
+modelValn <- data.frame(
+  Model=c("Random Forest cross-validation prediction","Random Forest Repeated cross-validation prediction"),
+  Pred_Accuracy=c(cm_rf$overall[1],cm_rcv$overall[1]),
+  OOB_error_rate=c(round(model_rfDef$finalModel$err.rate[500,1][["OOB"]]*100,4), round(model_rcvFinal$finalModel$err.rate[500,1][["OOB"]]*100,4)))
+
+```
+
+```{r Valnprint, results="asis"}
+print(xtable(modelValn, auto=TRUE), type="html")  
+
+```
+
+From the above ConfusionMatrix outputs we conclude that the Random Forest with repeated cross validation is the best model with high prediction accuracy and lower OOB error.
+
+## **Test data prediction/Conclusion**
+
+We now use the final best model and predict '**classe**' outcome on the test data set
+
+```{r predTest, echo=TRUE}
+set.seed(seedval)
+predTest_rcv <- predict(model_rcvFinal, testSmall)
+```
+
+```{r printPredTest}
+print("Test data prediction outcomes: ")
+print.AsIs(predTest_rcv)
+
+```
+
+
